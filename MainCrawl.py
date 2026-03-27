@@ -9,7 +9,7 @@ from openpyxl.styles import Font
 
 
 TEMPLATE_PATH = Path("Template") / "DanhSachGoiThau.xlsx"
-RESULT_PATH = Path("result")
+RESULT_PATH = Path("Result")
 
 # Template hiện tại dùng nhiều header viết tắt/thiếu ký tự tiếng Việt.
 LIST_HEADER_ALIASES = {
@@ -150,7 +150,8 @@ def crawler_dauthau_chuyen_nghiep():
     one_year_ago = current_date - datetime.timedelta(days=365)
 
     # Cài đặt số trang muốn cào (Ví dụ: Từ trang 1 đến trang 3)
-    for so_trang in range(1,28):
+    # for so_trang in range(1,28):
+    for so_trang in range(1):
         url = f"https://dauthau.asia/thongbao/moithau/?q=s%E1%BB%91+h%C3%B3a&type_search=1&type_info=1&type_info3=1&ketqua_luachon_tochuc_dgts=0&sfrom=26%2F03%2F2025&sto=26%2F03%2F2026&is_advance=0&is_province=0&is_kqlcnt=0&type_choose_id=0&search_idprovincekq=1&search_idprovince_khtt=1&oda=0&goods_2=0&searchkind=0&type_view_open=0&sl_nhathau=0&sl_nhathau_cgtt=0&search_idprovince=1&type_org=1&goods=0&cat=0&search_keyword_id_province=1&search_devprovince=1&oda=0&khlcnt=0&search_rq_province=-1&search_rq_province=1&rq_form_value=0&searching=1&page={so_trang}"
         print(f"\n---> [TRANG {so_trang}] Đang truy cập: {url}")
 

@@ -1,0 +1,18 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+
+# IDE metadata
+.idea/
+*.iml
+
+# Generated crawl outputs
+Result/
+result/
+DanhSachGoiThau_SoHoa_*.xlsx
+ThongKeDauThau.csv
+
