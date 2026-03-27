@@ -3,6 +3,7 @@ import time
 import datetime
 from pathlib import Path
 import re
+import html
 
 from openpyxl import load_workbook
 from openpyxl.styles import Font
@@ -20,15 +21,23 @@ LIST_HEADER_ALIASES = {
 }
 
 DETAIL_HEADER_ALIASES = {
+    "STT": [],
     "Mã TBMT": ["M TBMT"],
+    "Ngày đăng tải": ["Ngy đăng tải"],
+    "Kế hoạch": [],
     "Trạng thái gói thầu": ["Trạng thi gi thầu"],
     "Tên dự án": ["Tn dự n"],
     "Tên gói thầu": ["Tn gi thầu"],
+    "Chủ đầu tư": [],
     "Mã KHLCNT": ["M KHLCNT"],
     "Tên KHLCNT": ["Tn KHLCNT"],
     "Phân loại KHLCNT": ["Phn loại KHLCNT"],
+    "Trong nước/Quốc tế": [],
     "Phương thức lựa chọn nhà thầu": ["Phương thức lựa chọn nh thầu"],
+    "Thời gian thực hiện hợp đồng": [],
     "Hình thức LCNT": ["Hnh thức LCNT"],
+    "Thực hiện tại": [],
+    "Các thông báo liên quan": ["Cc thng bo lin quan"],
     "Thời điểm đóng thầu": ["Thời điểm đng thầu"],
     "Lĩnh vực AI phân loại": ["Lĩnh vực AI phn loại"],
     "Ngành nghề AI phân loại": ["Ngnh nghề AI phn loại"],
@@ -37,8 +46,15 @@ DETAIL_HEADER_ALIASES = {
     "Cơ quan ra quyết định phê duyệt": ["Cơ quan ra quyết định ph duyệt"],
     "Quyết định phê duyệt": ["Quyết định ph duyệt"],
     "Hình thức dự thầu": ["Hnh thức dự thầu"],
+    "Nhận HSDT từ": [],
     "Chi phí nộp E-HSDT": ["Chi ph nộp E-HSDT"],
+    "Địa điểm nhận E-HSDT": [],
+    "Địa điểm nhận": ["Địa điểm nhận E-HSDT"],
+    "E-HSDT": ["Nhận HSDT từ", "Chi phí nộp E-HSDT", "Địa điểm nhận E-HSDT"],
+    "Thời điểm mở thầu": [],
+    "Địa điểm mở thầu": [],
     "Giá gói thầu": ["Gi gi thầu"],
+    "Bằng chữ": [],
     "Kết quả lựa chọn nhà thầu": ["Kết quả lựa chọn nh thầu"],
     "Hình thức đảm bảo dự thầu": ["Hnh thức đảm bảo dự thầu"],
     "Thời hạn đảm bảo": ["Thời hạn đảm bảo"],
@@ -79,7 +95,10 @@ def _extract_text(node):
     direct_text = getattr(node, "text", "")
     if direct_text:
         # Ưu tiên text trực tiếp để tránh lặp khi node và node con chứa cùng nội dung.
-        return " ".join(str(direct_text).split()).strip()
+        direct_value = " ".join(str(direct_text).split()).strip()
+        # Một số node có text trực tiếp là "-" nhưng thực tế dữ liệu nằm ở node con.
+        if direct_value and direct_value not in {"-", "--", "---"}:
+            return direct_value
 
     parts = []
     try:
@@ -90,7 +109,20 @@ def _extract_text(node):
     except Exception:
         pass
 
-    return " ".join(" ".join(parts).split()).strip()
+    merged = " ".join(" ".join(parts).split()).strip()
+    if merged:
+        return merged
+
+    # Fallback cho trường hợp text nằm xen giữa các tag (ví dụ button có SVG + text).
+    html_content = getattr(node, "html_content", "")
+    if html_content:
+        raw_html = str(html_content)
+        raw_html = re.sub(r"<svg\b[\s\S]*?</svg>", " ", raw_html, flags=re.IGNORECASE)
+        raw_html = re.sub(r"<[^>]+>", " ", raw_html)
+        plain = html.unescape(raw_html)
+        return " ".join(plain.split()).strip()
+
+    return ""
 
 
 def _extract_ma_tbmt(*values):
@@ -104,7 +136,114 @@ def _extract_ma_tbmt(*values):
     return ""
 
 
-def _parse_detail_fields(detail_page):
+def _is_adv_placeholder(value):
+    text = (value or "").strip().lower()
+    if not text:
+        return False
+    # Nhận diện nội dung khóa điểm/tài khoản thay vì giá trị thật.
+    placeholders = [
+        "click",
+        "xem",
+        "thong tin",
+        "thông tin",
+        "dang nhap",
+        "đăng nhập",
+        "dang ky",
+        "đăng ký",
+        "bi tru",
+        "bị trừ",
+    ]
+    return ("click" in text and "xem" in text) or any(token in text for token in placeholders[4:])
+
+
+def _extract_adv_field_value(page, field_id):
+    nodes = page.css(f"#{field_id}")
+    if not nodes:
+        return ""
+    value = _extract_text(nodes[0])
+    if _is_adv_placeholder(value):
+        return ""
+    return value
+
+
+def _resolve_adv_detail_field(fetcher, detail_url, field_id):
+    if not fetcher or not detail_url:
+        return ""
+
+    selector = f"#{field_id} a[onclick*='click_view_detail_adv']"
+
+    def _click_action(page):
+        try:
+            page.on("dialog", lambda dialog: dialog.accept())
+        except Exception:
+            pass
+        try:
+            page.wait_for_selector(selector, timeout=5000)
+            page.click(selector)
+            page.wait_for_timeout(0)
+        except Exception:
+            pass
+
+    try:
+        clicked_page = fetcher.fetch(detail_url, wait=0, page_action=_click_action)
+    except Exception:
+        return ""
+
+    return _extract_adv_field_value(clicked_page, field_id)
+
+
+def _extract_latest_related_notice(detail_page):
+    """Lấy thông báo liên quan mới nhất theo thời điểm tìm thấy trong text/title."""
+    date_patterns = [
+        r"(\d{1,2}/\d{1,2}/\d{4})(?:\s+(\d{1,2}:\d{2}))?",
+        r"(\d{4}-\d{1,2}-\d{1,2})(?:\s+(\d{1,2}:\d{2}))?",
+    ]
+
+    def _parse_dt(text):
+        if not text:
+            return None
+        source = str(text)
+        for pattern in date_patterns:
+            match = re.search(pattern, source)
+            if not match:
+                continue
+            date_part = match.group(1)
+            time_part = match.group(2) or "00:00"
+            for fmt in ("%d/%m/%Y %H:%M", "%Y-%m-%d %H:%M"):
+                try:
+                    return datetime.datetime.strptime(f"{date_part} {time_part}", fmt)
+                except ValueError:
+                    continue
+        return None
+
+    def _is_related_notice(text, href):
+        haystack = f"{text or ''} {href or ''}".lower()
+        keywords = [
+            "thong bao", "thông báo", "tbmt", "moi thau", "mời thầu",
+            "lam ro", "làm rõ", "gia han", "gia hạn", "dinh chinh", "đính chính",
+        ]
+        return any(k in haystack for k in keywords)
+
+    related_candidates = []
+    for node in detail_page.css("a"):
+        href = node.attrib.get("href", "") if hasattr(node, "attrib") else ""
+        text = _extract_text(node)
+        if not href and not text:
+            continue
+        if not _is_related_notice(text, href):
+            continue
+        dt = _parse_dt(f"{text} {node.attrib.get('title', '') if hasattr(node, 'attrib') else ''}")
+        display = text or href
+        related_candidates.append((dt, display))
+
+    if not related_candidates:
+        return ""
+
+    related_candidates.sort(key=lambda x: x[0] or datetime.datetime.min, reverse=True)
+    return related_candidates[0][1]
+
+
+def _parse_detail_fields(detail_page, fetcher=None, detail_url=""):
     details = {}
     bidding_items = detail_page.css('.bidding-detail-item')
     for b_item in bidding_items:
@@ -136,6 +275,46 @@ def _parse_detail_fields(detail_page):
     if ma_nodes:
         details["Mã TBMT"] = _extract_ma_tbmt(_extract_text(ma_nodes[0]), details.get("Mã TBMT", ""))
 
+    # Trường "Kế hoạch" nằm ngoài khối .bidding-detail-item ở dạng button.
+    ke_hoach_nodes = detail_page.css('button.btn-dayleft, button.btn.btn-dayleft')
+    if ke_hoach_nodes:
+        ke_hoach_text = _extract_text(ke_hoach_nodes[0])
+        if ke_hoach_text:
+            details["Kế hoạch"] = ke_hoach_text
+
+    related_notice = _extract_latest_related_notice(detail_page)
+    if related_notice:
+        details["Các thông báo liên quan"] = related_notice
+
+    # Đồng bộ key để tăng khả năng map sang template mới.
+    if details.get("Địa điểm nhận E-HSDT") and not details.get("Địa điểm nhận"):
+        details["Địa điểm nhận"] = details["Địa điểm nhận E-HSDT"]
+    if details.get("Nhận HSDT từ") and not details.get("E-HSDT"):
+        details["E-HSDT"] = details["Nhận HSDT từ"]
+    if details.get("Trong nước - Quốc tế") and not details.get("Trong nước/Quốc tế"):
+        details["Trong nước/Quốc tế"] = details["Trong nước - Quốc tế"]
+
+    # Nâng cấp: với trường bị khóa điểm, tự click để lấy giá trị thật khi có thể.
+    # [COMMENT] Tạm thời tắt tính năng click để tối ưu tốc độ - để trường trống
+    # contract_field = "Thời gian thực hiện hợp đồng"
+    # contract_value = details.get(contract_field, "")
+    # if not contract_value:
+    #     contract_value = _extract_adv_field_value(detail_page, "thoi_gian_thuc_hien")
+    #     if contract_value:
+    #         details[contract_field] = contract_value
+    # if _is_adv_placeholder(contract_value):
+    #     resolved = _resolve_adv_detail_field(fetcher, detail_url, "thoi_gian_thuc_hien")
+    #     if resolved:
+    #         details[contract_field] = resolved
+    #         norm_key = _normalize_key(contract_field)
+    #         if norm_key and norm_key not in details:
+    #             details[norm_key] = resolved
+    #     else:
+    #         details[contract_field] = ""
+    #         norm_key = _normalize_key(contract_field)
+    #         if norm_key and norm_key in details:
+    #             details[norm_key] = ""
+
     return details
 
 def crawler_dauthau_chuyen_nghiep():
@@ -150,8 +329,8 @@ def crawler_dauthau_chuyen_nghiep():
     one_year_ago = current_date - datetime.timedelta(days=365)
 
     # Cài đặt số trang muốn cào (Ví dụ: Từ trang 1 đến trang 3)
-    # for so_trang in range(1,28):
-    for so_trang in range(1):
+    for so_trang in range(1,28):
+    # for so_trang in range(1):
         url = f"https://dauthau.asia/thongbao/moithau/?q=s%E1%BB%91+h%C3%B3a&type_search=1&type_info=1&type_info3=1&ketqua_luachon_tochuc_dgts=0&sfrom=26%2F03%2F2025&sto=26%2F03%2F2026&is_advance=0&is_province=0&is_kqlcnt=0&type_choose_id=0&search_idprovincekq=1&search_idprovince_khtt=1&oda=0&goods_2=0&searchkind=0&type_view_open=0&sl_nhathau=0&sl_nhathau_cgtt=0&search_idprovince=1&type_org=1&goods=0&cat=0&search_keyword_id_province=1&search_devprovince=1&oda=0&khlcnt=0&search_rq_province=-1&search_rq_province=1&rq_form_value=0&searching=1&page={so_trang}"
         print(f"\n---> [TRANG {so_trang}] Đang truy cập: {url}")
 
@@ -250,7 +429,7 @@ def crawler_dauthau_chuyen_nghiep():
             continue
 
         if detail_page.status == 200:
-            details = _parse_detail_fields(detail_page)
+            details = _parse_detail_fields(detail_page, fetcher=fetcher, detail_url=link)
 
             # Đồng bộ một số trường cốt lõi giữa list và detail.
             detail_ma = _extract_ma_tbmt(details.get("Mã TBMT", ""), item.get("Mã TBMT", ""))
@@ -263,7 +442,7 @@ def crawler_dauthau_chuyen_nghiep():
             all_data.append({**item, **details})
         else:
             print(f"[!] Lỗi lấy chi tiết: {link} | Status: {detail_page.status}")
-        time.sleep(2)  # Nghỉ để tránh bị block
+        time.sleep(0)  # Nghỉ để tránh bị block
 
     # === TỔNG KẾT VÀ LƯU FILE EXCEL THEO TEMPLATE ===
     if all_data:
@@ -282,7 +461,7 @@ def crawl_detail_dauthau(url):
     fetcher = StealthyFetcher(headless=True)
     page = fetcher.fetch(url)
     if page.status == 200:
-        details = _parse_detail_fields(page)
+        details = _parse_detail_fields(page, fetcher=fetcher, detail_url=url)
         return details
     else:
         return None
@@ -293,11 +472,15 @@ def export_to_template_workbook(all_data):
         raise FileNotFoundError(f"Không tìm thấy template: {TEMPLATE_PATH}")
 
     wb = load_workbook(TEMPLATE_PATH)
-    if "DanhSachGoiThau" not in wb.sheetnames or "STT" not in wb.sheetnames:
-        raise ValueError("Template phải có 2 sheet: 'DanhSachGoiThau' và 'STT'.")
+    if "DanhSachGoiThau" not in wb.sheetnames:
+        raise ValueError("Template phải có sheet 'DanhSachGoiThau'.")
+
+    detail_sheet_name = "Detail" if "Detail" in wb.sheetnames else "STT" if "STT" in wb.sheetnames else None
+    if not detail_sheet_name:
+        raise ValueError("Template phải có sheet detail: 'Detail' (mới) hoặc 'STT' (cũ).")
 
     ws_list = wb["DanhSachGoiThau"]
-    ws_detail_template = wb["STT"]
+    ws_detail_template = wb[detail_sheet_name]
 
     list_headers = {}
     list_headers_norm = {}
@@ -322,7 +505,7 @@ def export_to_template_workbook(all_data):
     duong_dan_col = _get_list_col("Đường dẫn")
     dong_thau_col = _get_list_col("Đóng thầu", "Thời điểm đóng thầu")
 
-    # Lập map cột của sheet STT dựa trên hàng tiêu đề (row 1).
+    # Lập map cột của sheet detail dựa trên hàng tiêu đề (row 1).
     detail_header_col_map = {}
     detail_header_col_map_norm = {}
     for col in range(1, ws_detail_template.max_column + 1):
@@ -332,7 +515,7 @@ def export_to_template_workbook(all_data):
             detail_header_col_map[header_text] = col
             detail_header_col_map_norm[_normalize_key(header_text)] = col
 
-    # Xoa du lieu cu tren sheet STT (tu dong 2 tro di) de tranh ton du lieu lan chay truoc.
+    # Xoa du lieu cu tren sheet detail (tu dong 2 tro di) de tranh ton du lieu lan chay truoc.
     for detail_row in range(2, ws_detail_template.max_row + 1):
         for col in detail_header_col_map.values():
             ws_detail_template.cell(detail_row, col).value = ""
@@ -342,7 +525,14 @@ def export_to_template_workbook(all_data):
         detail_row = idx + 1
         url = record.get("Đường dẫn", "")
 
-        # Ghi detail cua tung ban ghi vao cung 1 sheet STT, moi ban ghi 1 dong.
+        # Ghi detail cua tung ban ghi vao cung 1 sheet detail, moi ban ghi 1 dong.
+        stt_detail_col = _lookup_col(detail_header_col_map, detail_header_col_map_norm, "STT", DETAIL_HEADER_ALIASES.get("STT", []))
+        ngay_dang_detail_col = _lookup_col(detail_header_col_map, detail_header_col_map_norm, "Ngày đăng tải", DETAIL_HEADER_ALIASES.get("Ngày đăng tải", []))
+        if stt_detail_col:
+            ws_detail_template.cell(detail_row, stt_detail_col).value = idx
+        if ngay_dang_detail_col:
+            ws_detail_template.cell(detail_row, ngay_dang_detail_col).value = record.get("Ngày đăng tải", "")
+
         for key, value in record.items():
             key_text = str(key).strip()
             col = _lookup_col(
@@ -357,7 +547,7 @@ def export_to_template_workbook(all_data):
         if stt_col:
             cell = ws_list.cell(row, stt_col)
             cell.value = idx
-            cell.hyperlink = f"#'STT'!A{detail_row}"
+            cell.hyperlink = f"#'{detail_sheet_name}'!A{detail_row}"
             cell.font = Font(color="0563C1", underline="single")
 
         if ma_tbmt_col:
