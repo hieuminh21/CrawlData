@@ -5,6 +5,10 @@ from pathlib import Path
 import re
 import html
 import unicodedata
+import logging
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+from urllib.parse import urlencode
 
 from openpyxl import load_workbook
 from openpyxl.styles import Font
@@ -13,6 +17,82 @@ from openpyxl.styles import Font
 TEMPLATE_PATH = Path("Template") / "DanhSachGoiThau.xlsx"
 RESULT_PATH = Path("Result")
 BASE_URL = "https://dauthau.asia"
+SEARCH_PATH = "/thongbao/moithau/"
+
+SEARCH_PARAMS_BASE = [
+    ("type_search", "1"),
+    ("type_info", "1"),
+    ("type_info3", "1"),
+    ("ketqua_luachon_tochuc_dgts", "0"),
+    ("is_advance", "0"),
+    ("is_province", "0"),
+    ("is_kqlcnt", "0"),
+    ("type_choose_id", "0"),
+    ("search_idprovincekq", "1"),
+    ("search_idprovince_khtt", "1"),
+    ("oda", "0"),
+    ("goods_2", "0"),
+    ("searchkind", "0"),
+    ("type_view_open", "0"),
+    ("sl_nhathau", "0"),
+    ("sl_nhathau_cgtt", "0"),
+    ("search_idprovince", "1"),
+    ("type_org", "1"),
+    ("goods", "0"),
+    ("cat", "0"),
+    ("search_keyword_id_province", "1"),
+    ("search_devprovince", "1"),
+    ("khlcnt", "0"),
+    ("search_rq_province", "-1"),
+    ("search_rq_province", "1"),
+    ("rq_form_value", "0"),
+    ("searching", "1"),
+]
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class CrawlerConfig:
+    keyword: str = "số hóa"
+    max_page: int = 27
+    lookback_days: int = 365
+    request_delay: float = 0
+    max_retry: int = 2
+    headless: bool = False
+    end_date: datetime.date = field(default_factory=lambda: datetime.date.today())
+
+    @property
+    def start_date(self) -> datetime.date:
+        return self.end_date - datetime.timedelta(days=self.lookback_days)
+
+    @property
+    def valid_years(self) -> set:
+        return set(range(self.start_date.year, self.end_date.year + 1))
+
+
+@dataclass
+class Tender:
+    ma_tbmt: str
+    goi_thau: str
+    ngay_dang_tai: str
+    dong_thau: str
+    duong_dan: str
+    details: Dict[str, str] = field(default_factory=dict)
+
+    def to_list_record(self) -> Dict[str, str]:
+        return {
+            "Mã TBMT": self.ma_tbmt,
+            "Gói thầu": self.goi_thau,
+            "Ngày đăng tải": self.ngay_dang_tai,
+            "Đóng thầu": self.dong_thau,
+            "Đường dẫn": self.duong_dan,
+        }
+
+    def to_export_record(self) -> Dict[str, str]:
+        base = self.to_list_record()
+        base.update(self.details)
+        return base
 
 # Template hiện tại dùng nhiều header viết tắt/thiếu ký tự tiếng Việt.
 LIST_HEADER_ALIASES = {
@@ -465,177 +545,197 @@ def _parse_detail_fields(detail_page, fetcher=None, detail_url=""):
 
     return details
 
-def crawler_dauthau_chuyen_nghiep():
-    print("=== KHỞI ĐỘNG CRAWLER CHUYÊN NGHIỆP ===")
+def build_search_url(page_number: int, config: CrawlerConfig) -> str:
+    dynamic_params = [
+        ("q", config.keyword),
+        ("sfrom", config.start_date.strftime("%d/%m/%Y")),
+        ("sto", config.end_date.strftime("%d/%m/%Y")),
+        ("page", str(page_number)),
+    ]
+    query = urlencode(dynamic_params + SEARCH_PARAMS_BASE, doseq=True)
+    return f"{BASE_URL}{SEARCH_PATH}?{query}"
 
-    # Khởi tạo trình duyệt, hiện giao diện để bạn dễ xử lý Captcha
-    fetcher = StealthyFetcher(headless=False)
-    filtered_links = []  # Danh sách link đã lọc
 
-    # Ngày hiện tại và ngày một năm trước
-    current_date = datetime.datetime(2026, 3, 26)
-    one_year_ago = current_date - datetime.timedelta(days=365)
-
-    # Cài đặt số trang muốn cào (Ví dụ: Từ trang 1 đến trang 3)
-    for so_trang in range(1,28):
-    # for so_trang in range(1):
-        url = f"https://dauthau.asia/thongbao/moithau/?q=s%E1%BB%91+h%C3%B3a&type_search=1&type_info=1&type_info3=1&ketqua_luachon_tochuc_dgts=0&sfrom=26%2F03%2F2025&sto=26%2F03%2F2026&is_advance=0&is_province=0&is_kqlcnt=0&type_choose_id=0&search_idprovincekq=1&search_idprovince_khtt=1&oda=0&goods_2=0&searchkind=0&type_view_open=0&sl_nhathau=0&sl_nhathau_cgtt=0&search_idprovince=1&type_org=1&goods=0&cat=0&search_keyword_id_province=1&search_devprovince=1&oda=0&khlcnt=0&search_rq_province=-1&search_rq_province=1&rq_form_value=0&searching=1&page={so_trang}"
-        print(f"\n---> [TRANG {so_trang}] Đang truy cập: {url}")
-
-        # Truy cập trang và đợi load xong JavaScript
-        page = fetcher.fetch(url)
-
-        # Xử lý thời gian chờ để vượt mặt hệ thống chống Bot
-        if so_trang == 1:
-            print("ĐANG ĐỢI 0 GIÂY: Hãy nhấp giải Captcha trên trình duyệt (nếu có)!")
-            time.sleep(0)
-        else:
-            print("Nghỉ ngơi 0 giây để tránh bị khóa IP...")
-            time.sleep(0)
-
-        # Nếu vào trang thành công
-        if page.status == 200:
-            # Lấy tất cả các dòng (tr) trong trang web
-            cac_dong = page.css('tr')
-            so_luong_trang_nay = 0
-            print(f"[DEBUG] Số lượng hàng (tr) tìm thấy: {len(cac_dong)}")
-
-            for dong in cac_dong:
-                # 1. Tìm Gói Thầu (Vào tận thẻ a)
-                a_goi_thau = dong.css('td[data-column="Gói thầu"] a')
-
-                if a_goi_thau:
-                    # --- LẤY TÊN VÀ MÃ GÓI THẦU CHUẨN XÁC ---
-                    # Lấy tên gói thầu từ title
-                    goi_thau = a_goi_thau[0].attrib.get('title', '').strip()
-                    if not goi_thau:
-                        goi_thau = a_goi_thau[0].text.strip()
-
-                    # Lấy Mã TBMT
-                    ma_tbmt_node = a_goi_thau[0].css('span.bidding-code')
-                    ma_tbmt = _extract_ma_tbmt(
-                        _extract_text(ma_tbmt_node[0]) if ma_tbmt_node else "",
-                        a_goi_thau[0].attrib.get('title', ''),
-                        a_goi_thau[0].text,
-                    )
-
-                    # Lấy link gốc
-                    link = a_goi_thau[0].attrib.get('href', '')
-                    full_link = link if link.startswith('http') else "https://dauthau.asia" + link
-
-                    if not goi_thau:
-                        goi_thau = full_link.split('/')[-1]  # Phương án back-up cuối cùng
-
-                    # 2. Ngày đăng tải
-                    div_ngay_dang = dong.css('td[data-column="Ngày đăng tải"] div')
-                    ngay_dang = div_ngay_dang[0].text.strip() if div_ngay_dang else ""
-
-                    # 3. Đóng thầu (ở danh sách)
-                    div_dong_thau = dong.css('td[data-column="Đóng thầu"] div')
-                    dong_thau = _extract_text(div_dong_thau[0]) if div_dong_thau else ""
-
-                    # Lọc chỉ theo năm, không lấy ngày tháng
-                    nam_hop_le = False
-                    try:
-                        # Lấy 4 ký tự cuối cùng (năm) từ ngày đăng tải
-                        if len(ngay_dang) >= 4:
-                            nam = int(ngay_dang[-4:])
-                            if nam in [2025, 2026]:
-                                nam_hop_le = True
-                                if "số hóa" in goi_thau.lower():
-                                    # Lưu từng bản ghi phù hợp ra file riêng biệt
-                                    record = {
-                                        "Mã TBMT": ma_tbmt,
-                                        "Gói thầu": goi_thau,
-                                        "Ngày đăng tải": ngay_dang,
-                                        "Đóng thầu": dong_thau,
-                                        "Đường dẫn": full_link
-                                    }
-                                    filtered_links.append(record)
-                                    so_luong_trang_nay += 1
-                                    # Log chi tiết từng gói thầu trên trang
-                                    print(f"[CHECK] Gói thầu: {goi_thau} | Ngày đăng: {ngay_dang}")
-                    except Exception as e:
-                        pass
-
-            print(f"[+] Hoàn thành Trang {so_trang}: Thu được {so_luong_trang_nay} gói thầu phù hợp.")
-
-        else:
-            print(f"[!] Lỗi ở Trang {so_trang} (Mã: {page.status}). Dừng Crawler!")
-            break
-
-    # === LẤY CHI TIẾT TỪ CÁC LINK ĐÃ LỌC ===
-    all_data = []
-    for item in filtered_links:
-        link = item["Đường dẫn"]
-        print(f"\n---> Đang lấy chi tiết: {link}")
+def fetch_page(fetcher, url: str, config: CrawlerConfig, wait: int = 0):
+    for attempt in range(1, config.max_retry + 2):
         try:
-            detail_page = fetcher.fetch(link)
+            return fetcher.fetch(url, wait=wait)
         except Exception as ex:
-            print(f"[!] Timeout/lỗi khi lấy chi tiết, bỏ qua link: {link} | {ex}")
-            time.sleep(2)
+            logger.warning("Fetch lỗi (lần %s): %s | %s", attempt, url, ex)
+            if attempt > config.max_retry:
+                return None
+            if config.request_delay:
+                time.sleep(config.request_delay)
+    return None
+
+
+def fetch_list_page(fetcher, page_number: int, config: CrawlerConfig):
+    url = build_search_url(page_number, config)
+    logger.info("[TRANG %s] Truy cập: %s", page_number, url)
+    return fetch_page(fetcher, url, config)
+
+
+def fetch_detail_page(fetcher, detail_url: str, config: CrawlerConfig):
+    return fetch_page(fetcher, detail_url, config)
+
+
+def is_valid_item(goi_thau: str, ngay_dang: str, config: CrawlerConfig) -> bool:
+    if not goi_thau or config.keyword.lower() not in goi_thau.lower():
+        return False
+
+    try:
+        year = int(str(ngay_dang)[-4:])
+    except Exception:
+        return False
+    return year in config.valid_years
+
+
+def parse_list_page(page, config: CrawlerConfig) -> List[Tender]:
+    results: List[Tender] = []
+    cac_dong = page.css("tr")
+    logger.debug("Số lượng hàng (tr) tìm thấy: %s", len(cac_dong))
+
+    for dong in cac_dong:
+        a_goi_thau = dong.css('td[data-column="Gói thầu"] a')
+        if not a_goi_thau:
             continue
 
-        if detail_page.status == 200:
-            details = _parse_detail_fields(detail_page, fetcher=fetcher, detail_url=link)
+        goi_thau = a_goi_thau[0].attrib.get("title", "").strip()
+        if not goi_thau:
+            goi_thau = (a_goi_thau[0].text or "").strip()
 
-            kqlcnt_url = details.get("KQLCNT_URL", "")
-            if kqlcnt_url:
-                try:
-                    kqlcnt_page = fetcher.fetch(kqlcnt_url, wait=0)
-                    if kqlcnt_page.status == 200:
-                        kqlcnt_data = _parse_kqlcnt_award_page(kqlcnt_page)
-                        bidder_names = kqlcnt_data.get("Tên nhà thầu", "")
-                        award_prices = kqlcnt_data.get("Giá trúng thầu", "")
-                        if bidder_names:
-                            details["Kết quả lựa chọn nhà thầu"] = bidder_names
-                            details["Tên nhà thầu"] = bidder_names
-                        if award_prices:
-                            details["Giá trúng thầu"] = award_prices
-                except Exception as ex:
-                    print(f"[WARN] Không lấy được trang KQLCNT: {kqlcnt_url} | {ex}")
+        ma_tbmt_node = a_goi_thau[0].css("span.bidding-code")
+        ma_tbmt = _extract_ma_tbmt(
+            _extract_text(ma_tbmt_node[0]) if ma_tbmt_node else "",
+            a_goi_thau[0].attrib.get("title", ""),
+            a_goi_thau[0].text,
+        )
 
-            if not details.get("Kết quả lựa chọn nhà thầu"):
-                details["Kết quả lựa chọn nhà thầu"] = "Chưa có kết quả"
-            if not details.get("Tên nhà thầu"):
-                details["Tên nhà thầu"] = details.get("Kết quả lựa chọn nhà thầu", "")
-            if not details.get("Giá trúng thầu"):
-                details["Giá trúng thầu"] = "" if kqlcnt_url else "Chưa có kết quả"
+        full_link = _to_absolute_url(a_goi_thau[0].attrib.get("href", ""))
+        if not goi_thau:
+            goi_thau = full_link.split("/")[-1]
 
-            # Đồng bộ một số trường cốt lõi giữa list và detail.
-            detail_ma = _extract_ma_tbmt(details.get("Mã TBMT", ""), item.get("Mã TBMT", ""))
-            if detail_ma:
-                item["Mã TBMT"] = detail_ma
+        div_ngay_dang = dong.css('td[data-column="Ngày đăng tải"] div')
+        ngay_dang = (div_ngay_dang[0].text or "").strip() if div_ngay_dang else ""
 
-            if not item.get("Đóng thầu"):
-                item["Đóng thầu"] = details.get("Thời điểm đóng thầu", "") or details.get("Thời điểm đng thầu", "")
+        div_dong_thau = dong.css('td[data-column="Đóng thầu"] div')
+        dong_thau = _extract_text(div_dong_thau[0]) if div_dong_thau else ""
 
-            all_data.append({**item, **details})
-        else:
-            print(f"[!] Lỗi lấy chi tiết: {link} | Status: {detail_page.status}")
-        time.sleep(0)  # Nghỉ để tránh bị block
+        if not is_valid_item(goi_thau, ngay_dang, config):
+            continue
 
-    # === TỔNG KẾT VÀ LƯU FILE EXCEL THEO TEMPLATE ===
-    if all_data:
-        print(f"\n[DEBUG] Tổng số bản ghi: {len(all_data)}")
-        file_name = export_to_template_workbook(all_data)
-        print("\n===============================")
-        print(f"Đã thu thập thành công tổng cộng {len(all_data)} gói thầu số hóa.")
-        print(f"Dữ liệu đã được lưu vào: {file_name}")
-        print("===============================\n")
-    else:
-        print("\n[!] Không lấy được dữ liệu phù hợp.")
+        tender = Tender(
+            ma_tbmt=ma_tbmt,
+            goi_thau=goi_thau,
+            ngay_dang_tai=ngay_dang,
+            dong_thau=dong_thau,
+            duong_dan=full_link,
+        )
+        results.append(tender)
+        logger.debug("[CHECK] %s | Ngày đăng: %s", goi_thau, ngay_dang)
+
+    return results
+
+
+def crawl_list(fetcher, config: CrawlerConfig) -> List[Tender]:
+    filtered_links: List[Tender] = []
+    for so_trang in range(1):
+    # for so_trang in range(1, config.max_page + 1):
+
+        page = fetch_list_page(fetcher, so_trang, config)
+        if page is None:
+            logger.error("Không thể tải trang %s sau khi retry.", so_trang)
+            break
+
+        if so_trang == 1:
+            logger.info("Nếu có captcha, xử lý trên trình duyệt rồi tiếp tục.")
+
+        if page.status != 200:
+            logger.error("Lỗi trang %s (status=%s). Dừng crawler list.", so_trang, page.status)
+            break
+
+        parsed = parse_list_page(page, config)
+        filtered_links.extend(parsed)
+        logger.info("Hoàn thành trang %s: %s gói thầu phù hợp.", so_trang, len(parsed))
+
+        if config.request_delay:
+            time.sleep(config.request_delay)
 
     return filtered_links
 
-def crawl_detail_dauthau(url):
-    fetcher = StealthyFetcher(headless=True)
-    page = fetcher.fetch(url)
-    if page.status == 200:
-        details = _parse_detail_fields(page, fetcher=fetcher, detail_url=url)
-        return details
-    else:
+
+def crawl_detail(fetcher, tender: Tender, config: CrawlerConfig) -> Optional[Tender]:
+    logger.info("Lấy chi tiết: %s", tender.duong_dan)
+    detail_page = fetch_detail_page(fetcher, tender.duong_dan, config)
+    if detail_page is None:
+        logger.warning("Bỏ qua link do lỗi fetch: %s", tender.duong_dan)
         return None
+    if detail_page.status != 200:
+        logger.warning("Lỗi lấy chi tiết: %s | Status: %s", tender.duong_dan, detail_page.status)
+        return None
+
+    details = _parse_detail_fields(detail_page, fetcher=fetcher, detail_url=tender.duong_dan)
+
+    kqlcnt_url = details.get("KQLCNT_URL", "")
+    if kqlcnt_url:
+        kqlcnt_page = fetch_page(fetcher, kqlcnt_url, config, wait=0)
+        if kqlcnt_page and kqlcnt_page.status == 200:
+            kqlcnt_data = _parse_kqlcnt_award_page(kqlcnt_page)
+            bidder_names = kqlcnt_data.get("Tên nhà thầu", "")
+            award_prices = kqlcnt_data.get("Giá trúng thầu", "")
+            if bidder_names:
+                details["Kết quả lựa chọn nhà thầu"] = bidder_names
+                details["Tên nhà thầu"] = bidder_names
+            if award_prices:
+                details["Giá trúng thầu"] = award_prices
+        else:
+            logger.warning("Không lấy được trang KQLCNT: %s", kqlcnt_url)
+
+    if not details.get("Kết quả lựa chọn nhà thầu"):
+        details["Kết quả lựa chọn nhà thầu"] = "Chưa có kết quả"
+    if not details.get("Tên nhà thầu"):
+        details["Tên nhà thầu"] = details.get("Kết quả lựa chọn nhà thầu", "")
+    if not details.get("Giá trúng thầu"):
+        details["Giá trúng thầu"] = "" if kqlcnt_url else "Chưa có kết quả"
+
+    tender.ma_tbmt = _extract_ma_tbmt(details.get("Mã TBMT", ""), tender.ma_tbmt) or tender.ma_tbmt
+    if not tender.dong_thau:
+        tender.dong_thau = details.get("Thời điểm đóng thầu", "") or details.get("Thời điểm đng thầu", "")
+    tender.details = details
+    return tender
+
+
+def crawler_dauthau_chuyen_nghiep(config: Optional[CrawlerConfig] = None):
+    config = config or CrawlerConfig()
+    logger.info("=== KHỞI ĐỘNG CRAWLER CHUYÊN NGHIỆP ===")
+
+    fetcher = StealthyFetcher(headless=config.headless)
+    list_items = crawl_list(fetcher, config)
+
+    all_data: List[Dict[str, str]] = []
+    for tender in list_items:
+        tender_with_detail = crawl_detail(fetcher, tender, config)
+        if tender_with_detail:
+            all_data.append(tender_with_detail.to_export_record())
+        if config.request_delay:
+            time.sleep(config.request_delay)
+
+    if all_data:
+        logger.info("Tổng số bản ghi: %s", len(all_data))
+        file_name = export_to_template_workbook(all_data)
+        logger.info("Đã thu thập %s gói thầu số hóa. File: %s", len(all_data), file_name)
+    else:
+        logger.warning("Không lấy được dữ liệu phù hợp.")
+
+    return [item.to_list_record() for item in list_items]
+
+def crawl_detail_dauthau(url, config: Optional[CrawlerConfig] = None):
+    config = config or CrawlerConfig(headless=True)
+    fetcher = StealthyFetcher(headless=config.headless)
+    page = fetch_detail_page(fetcher, url, config)
+    if page and page.status == 200:
+        return _parse_detail_fields(page, fetcher=fetcher, detail_url=url)
+    return None
 
 
 def export_to_template_workbook(all_data):
@@ -740,4 +840,8 @@ def export_to_template_workbook(all_data):
     return str(output_path)
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+    )
     crawler_dauthau_chuyen_nghiep()

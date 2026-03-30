@@ -25,3 +25,180 @@ Nâng cấp:
 - đây là sau khi click:
 <div class="c-val" id="thoi_gian_thuc_hien" data-typesearch="0">60 Ngày</div> //-> đây là giá trị
 
+Nâng cấp 2:
+2, Trường "Kết quả lựa chọn nhà thầu" và "Giá trúng thầu" :
+
+# Phương án nâng cấp crawl KQLCNT (Kết quả lựa chọn nhà thầu)
+
+Tài liệu này mô tả rõ:
+1) Thẻ nào thì **vào link detail kết quả** để lấy dữ liệu, thẻ nào thì **không**.
+2) Xử lý kỹ thuật trong Python (Scrapling) như thế nào.
+3) Lấy trường gì, ở đâu (selector/thẻ nào).
+
+---
+
+## 1) Quy tắc phân biệt: vào link detail hay không
+
+### 1.1. **KHÔNG vào** link detail kết quả (bỏ qua)
+Khi trong `div.c-val` của field “Kết quả lựa chọn nhà thầu” có nội dung dạng **chưa có kết quả / yêu cầu VIP**, ví dụ:
+
+```html
+<div class="c-val">
+  Chưa có kết quả. Hãy <a href="https://dauthau.asia/page/bang-gia-goi-vip1-vip2.html">nâng cấp lên tài khoản VIP1</a>
+  để nhận thông báo qua email ngay khi kết quả được đăng tải.
+</div>
+```
+
+**Đặc điểm nhận diện:**
+- Không có link `/ketqua/...`
+- Có text như: `Chưa có kết quả`, hoặc `nâng cấp`, `VIP1`
+- Link trong `div.c-val` (nếu có) thường là:
+  - `https://dauthau.asia/page/bang-gia-goi-vip1-vip2.html`
+
+=> Kết luận: **bỏ qua**, không fetch trang `/ketqua/...`.
+
+---
+
+### 1.2. **CÓ vào** link detail kết quả (crawl tiếp)
+Khi `div.c-val` có câu “Xem chi tiết …” và có link tr�� tới `/ketqua/...`, ví dụ:
+
+```html
+<div class="c-val">
+  Xem chi tiết <a href="/ketqua/luachon-nhathau/....html">tại đây</a>.
+  Bạn muốn nhận thông báo... hãy <a href="https://dauthau.asia/page/bang-gia-goi-vip1-vip2.html">nâng cấp tài khoản VIP1</a>.
+</div>
+```
+
+**Đặc điểm nhận diện:**
+- Có thẻ `a` với `href` bắt đầu bằng `/ketqua/`
+- Có thể vẫn kèm link VIP ở phía sau, nhưng **chỉ cần có `/ketqua/` là crawl tiếp**
+
+=> Kết luận: **vào link `/ketqua/...`** để lấy dữ liệu.
+
+---
+
+## 2) Cách xử lý trong Python (Scrapling) — luồng xử lý đề xuất
+
+### 2.1. Điểm đặt logic
+Sau khi bạn fetch trang “mời thầu” (link ở danh sách) và parse detail bằng `_parse_detail_fields(...)`:
+
+- Tại field “Kết quả lựa chọn nhà thầu”:
+  1) Nếu có link `/ketqua/...` -> tạo `KQLCNT_URL` (absolute).
+  2) Nếu không có -> không tạo `KQLCNT_URL` (hoặc để rỗng).
+
+Sau đó:
+- Nếu `KQLCNT_URL` có giá trị -> `fetcher.fetch(KQLCNT_URL)` và parse bảng kết quả.
+
+---
+
+### 2.2. Hàm nhận diện & trích link `/ketqua/...` (selector chính)
+**Selector chính để phân biệt:**
+- `a[href^="/ketqua/"]`
+
+**Hành vi:**
+- Nếu tìm thấy selector này trong `value_node` => có kết quả => vào.
+- Nếu không => kiểm tra placeholder VIP => bỏ qua.
+
+> Lưu ý: không dùng `_extract_text()` để phân biệt, vì `_extract_text()` mất thông tin `href`.
+
+---
+
+### 2.3. Fallback (nếu HTML thay đổi nhẹ)
+Nếu site đổi không còn `/ketqua/` dạng prefix nhưng vẫn có “Xem chi tiết”, có thể fallback:
+- tìm `text` chứa `xem chi tiết`
+- lấy link `a[href]` đầu tiên **không phải** link VIP.
+
+---
+
+## 3) Lấy dữ liệu “Tên nhà thầu” & “Giá trúng thầu” ở trang `/ketqua/...`
+
+### 3.1. Vị trí dữ liệu
+Trang `/ketqua/...` có khối bảng:
+
+- Container: `div.table-responsive.bidding_table`
+- Table body: `tbody#list_business_online`
+- Mỗi nhà thầu trúng thầu là 1 dòng: `#list_business_online tr`
+
+Ví dụ bạn cung cấp:
+
+```html
+<tbody id="list_business_online">
+  <tr>
+    <td>1</td>
+    <td>vn2400861889</td>
+    <td>...</td>
+    <td>  <!-- cột Tên nhà thầu -->
+      <h3><a href="/businesslistings/detail/...">CÔNG TY ...</a></h3>
+    </td>
+    <td>Giá dự thầu</td>
+    <td>...</td>
+    <td>  <!-- cột Giá trúng thầu -->
+      3.740.835.000 VND
+    </td>
+    ...
+  </tr>
+</tbody>
+```
+
+---
+
+### 3.2. Trường cần lấy và selector/thẻ cụ thể
+
+#### A) Trường: **Tên nhà thầu**
+- Nằm trong cột **thứ 4** của mỗi `tr`
+- Thẻ ưu tiên: `td:nth-child(4) a`
+- Trong code dựa theo list `tds`:
+  - `tds[3]` (index 0-based)
+  - Lấy `a` bên trong `tds[3]` nếu có
+
+#### B) Trường: **Giá trúng thầu**
+- Nằm trong cột **thứ 7** của mỗi `tr`
+- Theo list `tds`:
+  - `tds[6]` (index 0-based)
+  - Lấy text và chuẩn hóa khoảng trắng
+
+---
+
+### 3.3. Trường hợp nhiều nhà thầu trúng thầu
+Có thể có nhiều dòng trong `#list_business_online`.
+
+Có 2 cách lưu ra Excel:
+1) **Chỉ lấy dòng đầu tiên**:
+   - `Tên nhà thầu` = dòng 1
+   - `Giá trúng thầu` = dòng 1
+2) **Lấy tất cả và join** (đề xuất nếu dữ liệu nhiều nhà thầu):
+   - `Tên nhà thầu` = `"; ".join([...])`
+   - `Giá trúng thầu` = `"; ".join([...])`
+
+---
+
+## 4) Output đề xuất (ghi vào record để export Excel)
+
+Khi có kết quả:
+- `details["Tên nhà thầu"] = ...`
+- `details["Giá trúng thầu"] = ...`
+- (tùy chọn) `details["KQLCNT_URL"] = ...` để debug/truy xuất
+
+Khi không có kết quả/VIP:
+- set 2 trường trên = `""` (trống)
+
+---
+
+## 5) Checklist triển khai nhanh
+
+- [ ] Trong `_parse_detail_fields(...)`: bắt được field “Kết quả lựa chọn nhà thầu” và set `KQLCNT_URL` nếu có `/ketqua/`
+- [ ] Trong loop crawl detail: nếu `KQLCNT_URL` != "" thì fetch trang kết quả
+- [ ] Parse bảng `#list_business_online tr` để lấy:
+  - `Tên nhà thầu` từ `tds[3]`
+  - `Giá trúng thầu` từ `tds[6]`
+- [ ] Gộp vào `all_data.append({**item, **details})`
+- [ ] Export ra Excel như các field khác
+
+---
+
+## 6) Gợi ý mở rộng (không bắt buộc)
+- Lưu thêm “Mã định danh” (cột 2) để đối soát.
+- Chuẩn hóa tiền sang số int (remove dấu `.` và chữ `VND`) nếu cần thống kê.
+- Thêm retry/timeout riêng cho trang `/ketqua/` để ổn định.
+
+
